@@ -1,26 +1,20 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, Corners, DevicePixels, ExternalPaths, IntoElement,
-    ParentElement, PathPromptOptions, Pixels, Render, RenderImage, Rgba, SharedString, Size,
-    Styled, Window, canvas, div, point, prelude::*, px, rgb, size,
+    AnyElement, App, AppContext, Bounds, ClickEvent, Context, ExternalPaths, IntoElement,
+    ParentElement, PathPromptOptions, Render, RenderImage, SharedString, Styled, TitlebarOptions,
+    Window, WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, rgb, size,
 };
-use sentinel_core::{Device, DeviceState, Frame, Mirror, MirrorConfig, MirrorStatus, PixelFormat, adb};
+use sentinel_core::{Device, DeviceState, Mirror, MirrorConfig, MirrorStatus, PixelFormat, adb};
+
+use crate::{
+    popout::PopoutWindow,
+    screen::{self, ScreenState},
+    theme::*,
+};
 
 const FRAME_POLL: Duration = Duration::from_millis(8);
 const DEVICE_POLL: Duration = Duration::from_secs(2);
-
-// Colors
-const BG: u32 = 0x111318;
-const PANEL: u32 = 0x1a1d24;
-const PANEL_HOVER: u32 = 0x252a33;
-const BORDER: u32 = 0x2b303b;
-const TEXT: u32 = 0xe6e8ee;
-const MUTED: u32 = 0x8b92a1;
-const ACCENT: u32 = 0x3d8bfd;
-const OK: u32 = 0x3fb950;
-const WARN: u32 = 0xd29922;
-const ERR: u32 = 0xf85149;
 
 enum InstallState {
     Running,
@@ -39,6 +33,10 @@ pub struct SentinelApp {
     selected: Option<String>,
     mirror: Option<Mirror>,
     screen: Option<Arc<RenderImage>>,
+    /// The pop-out screen window, while the screen is popped out.
+    popout: Option<WindowHandle<PopoutWindow>>,
+    /// A pop-out window has been requested but not opened yet.
+    popout_opening: bool,
     installs: Vec<InstallJob>,
     /// Start mirroring as soon as a device is available (`--mirror` flag).
     auto_mirror: bool,
@@ -60,9 +58,20 @@ impl SentinelApp {
             selected: None,
             mirror: None,
             screen: None,
+            popout: None,
+            popout_opening: false,
             installs: Vec::new(),
             auto_mirror: std::env::args().any(|a| a == "--mirror"),
             _quit_subscription: quit,
+        }
+    }
+
+    /// Everything a window needs to draw the mirrored screen.
+    pub fn screen_state(&self) -> ScreenState {
+        ScreenState {
+            image: self.screen.clone(),
+            status: self.mirror.as_ref().map(|m| m.status()),
+            has_device: self.selected.is_some(),
         }
     }
 
@@ -126,8 +135,8 @@ impl SentinelApp {
     fn pull_frame(&mut self, cx: &mut Context<Self>) {
         let Some(mirror) = &self.mirror else { return };
         if let Some(frame) = mirror.take_frame() {
-            let image = Arc::new(to_render_image(frame));
-            // Free the previous frame's GPU texture, otherwise every frame leaks one.
+            let image = Arc::new(screen::to_render_image(frame));
+            // Free the previous frame's GPU texture (in every window), otherwise each frame leaks one.
             if let Some(old) = self.screen.replace(image) {
                 cx.drop_image(old, None);
             }
@@ -164,6 +173,7 @@ impl SentinelApp {
     }
 
     fn stop_mirror(&mut self, cx: &mut Context<Self>) {
+        self.pop_in(cx);
         if let Some(mirror) = self.mirror.take() {
             // Stopping joins the decode thread; do it off the UI thread.
             cx.background_executor().spawn(async move { drop(mirror) }).detach();
@@ -171,6 +181,75 @@ impl SentinelApp {
         if let Some(old) = self.screen.take() {
             cx.drop_image(old, None);
         }
+    }
+
+    /// Move the screen into its own window. The main window keeps running.
+    fn pop_out(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.popout {
+            // Already out: just bring it to the front.
+            handle.update(cx, |_, window, _| window.activate_window()).ok();
+            return;
+        }
+        if self.popout_opening {
+            return;
+        }
+        let state = self.screen_state();
+        let window_size = if state.is_portrait() { size(px(480.), px(940.)) } else { size(px(1000.), px(560.)) };
+        let title = match state.device_name() {
+            Some(name) => format!("{name} - Sentinel"),
+            None => "Screen - Sentinel".into(),
+        };
+        let bounds = Bounds::centered(None, window_size, cx);
+        let app = cx.entity();
+        let weak_app = app.downgrade();
+        self.popout_opening = true;
+
+        // `open_window` renders the new window immediately, and the pop-out reads this entity
+        // while rendering. We're inside this entity's update right now, so open it afterwards.
+        cx.defer(move |cx| {
+            let result = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions { title: Some(title.into()), ..Default::default() }),
+                    app_id: Some("sentinel".into()),
+                    ..Default::default()
+                },
+                {
+                    let app = app.clone();
+                    move |window, cx| {
+                        // Closing the window with the window manager's close button counts as popping back in.
+                        window.on_window_should_close(cx, move |_, cx| {
+                            weak_app.update(cx, |app, cx| app.popout_closed(cx)).ok();
+                            true
+                        });
+                        cx.new(|cx| PopoutWindow::new(app, cx))
+                    }
+                },
+            );
+            app.update(cx, |this, cx| {
+                this.popout_opening = false;
+                match result {
+                    Ok(handle) => this.popout = Some(handle),
+                    Err(err) => eprintln!("failed to open pop-out window: {err:#}"),
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Close the pop-out window (if any) and show the screen in the main window again.
+    /// Must not be called from inside the pop-out window itself; that uses [`Self::popout_closed`].
+    fn pop_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.popout.take() {
+            handle.update(cx, |_, window, _| window.remove_window()).ok();
+            cx.notify();
+        }
+    }
+
+    /// The pop-out window closed itself (its button, or the window manager).
+    pub fn popout_closed(&mut self, cx: &mut Context<Self>) {
+        self.popout = None;
+        cx.notify();
     }
 
     fn pick_apks(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -227,6 +306,7 @@ impl SentinelApp {
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let has_device = self.selected.is_some();
         let mirroring = self.mirror.is_some();
+        let popped_out = self.popout.is_some();
 
         let mut devices = div().flex().flex_col().gap_1();
         if let Some(err) = &self.device_error {
@@ -301,68 +381,71 @@ impl SentinelApp {
             .flex_none()
             .gap_4()
             .p_4()
-            .bg(rgb(0x15171d))
+            .bg(rgb(SIDEBAR))
             .border_r_1()
             .border_color(rgb(BORDER))
             .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).child("Sentinel"))
             .child(section_label("Devices"))
             .child(devices)
             .child(section_label("Screen"))
-            .child(button(
-                "mirror",
-                if mirroring { "Stop mirroring" } else { "Start mirroring" },
-                has_device,
-                mirroring,
-                cx.listener(Self::toggle_mirror),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(button(
+                        "mirror",
+                        if mirroring { "Stop mirroring" } else { "Start mirroring" },
+                        has_device,
+                        mirroring,
+                        cx.listener(Self::toggle_mirror),
+                    ))
+                    .child(button(
+                        "pop-toggle",
+                        if popped_out { "Pop back in" } else { "Pop out screen" },
+                        mirroring,
+                        true,
+                        cx.listener(|this, _, _, cx| {
+                            if this.popout.is_some() { this.pop_in(cx) } else { this.pop_out(cx) }
+                        }),
+                    )),
+            )
             .child(section_label("Apps"))
             .child(button("install", "Install APK…", has_device, false, cx.listener(Self::pick_apks)))
             .child(div().text_xs().text_color(rgb(MUTED)).child("…or drop .apk files anywhere on the window"))
             .child(div().flex().flex_col().gap_1().children(installs))
     }
 
-    fn render_screen(&self) -> AnyElement {
-        let center = || div().size_full().flex().items_center().justify_center().text_color(rgb(MUTED));
-
-        let status = self.mirror.as_ref().map(|m| m.status());
-        match (&self.screen, status) {
-            (_, Some(MirrorStatus::Failed(err))) => center()
-                .flex_col()
-                .gap_2()
-                .p_8()
-                .child(div().text_color(rgb(ERR)).child("Mirroring failed"))
-                .child(div().text_xs().child(err))
-                .into_any_element(),
-            (Some(image), _) => {
-                let image = image.clone();
-                // Paint directly so the frame always fits the pane (letterboxed), whatever the
-                // phone's orientation. `img()` lets the aspect ratio override the height.
-                div()
-                    .size_full()
-                    .p_4()
-                    .child(
-                        canvas(
-                            |_, _, _| (),
-                            move |bounds, _, window, _| {
-                                let target = fit_contain(bounds, image.size(0));
-                                window.paint_image(target, Corners::all(px(6.)), image, 0, false).ok();
-                            },
-                        )
-                        .size_full(),
-                    )
-                    .into_any_element()
-            }
-            (None, Some(MirrorStatus::Starting | MirrorStatus::Streaming { .. })) => {
-                center().child("Connecting to device…").into_any_element()
-            }
-            _ => center()
-                .child(if self.selected.is_some() {
-                    "Press “Start mirroring” to see your phone’s screen"
-                } else {
-                    "Connect a device to get started"
-                })
-                .into_any_element(),
+    fn render_main_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.popout.is_none() {
+            return screen::render(&self.screen_state());
         }
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(MUTED))
+            .child("The screen is open in its own window")
+            .child(
+                div().flex().gap_2().child(div().w(px(150.)).child(button(
+                    "show-popout",
+                    "Show window",
+                    true,
+                    true,
+                    cx.listener(|this, _, _, cx| this.pop_out(cx)),
+                )))
+                .child(div().w(px(150.)).child(button(
+                    "pop-in-main",
+                    "Pop back in",
+                    true,
+                    false,
+                    cx.listener(|this, _, _, cx| this.pop_in(cx)),
+                ))),
+            )
+            .into_any_element()
     }
 }
 
@@ -374,57 +457,26 @@ impl Render for SentinelApp {
             .size_full()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(0x18243a)))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(DROP_HIGHLIGHT)))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.install(paths.paths().to_vec(), cx);
             }))
             .child(self.render_sidebar(cx))
-            .child(div().flex_1().min_w_0().h_full().overflow_hidden().child(self.render_screen()))
+            .child(div().flex_1().min_w_0().h_full().overflow_hidden().child(self.render_main_pane(cx)))
     }
 }
 
-fn section_label(text: &'static str) -> impl IntoElement {
-    div().text_xs().text_color(rgb(MUTED)).child(text.to_uppercase())
-}
-
-fn button(
-    id: &'static str,
-    label: &'static str,
-    enabled: bool,
-    active: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let bg: Rgba = if active { rgb(PANEL_HOVER) } else { rgb(ACCENT) };
-    div()
-        .id(id)
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .text_sm()
-        .flex()
-        .justify_center()
-        .bg(bg)
-        .when(!enabled, |el| el.opacity(0.4))
-        .when(enabled, |el| el.cursor_pointer().hover(|s| s.opacity(0.85)).on_click(on_click))
-        .child(label)
-}
-
-/// Turn a core frame (already BGRA, which is what GPUI expects) into a GPUI image.
-fn to_render_image(frame: Frame) -> RenderImage {
-    let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.data)
-        .expect("frame buffer size matches dimensions");
-    RenderImage::new(vec![image::Frame::new(buffer)])
-}
-
-/// Largest rectangle with the image's aspect ratio that fits in `bounds`, centered.
-fn fit_contain(bounds: Bounds<Pixels>, image: Size<DevicePixels>) -> Bounds<Pixels> {
-    let (iw, ih) = (image.width.0 as f32, image.height.0 as f32);
-    let (bw, bh) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
-    if iw <= 0. || ih <= 0. {
-        return bounds;
-    }
-    let scale = (bw / iw).min(bh / ih);
-    let (w, h) = (iw * scale, ih * scale);
-    let origin = bounds.origin + point(px((bw - w) / 2.), px((bh - h) / 2.));
-    Bounds::new(origin, size(px(w), px(h)))
+/// Open the main Sentinel window.
+pub fn open_main_window(cx: &mut App) -> WindowHandle<SentinelApp> {
+    let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions { title: Some("Sentinel".into()), ..Default::default() }),
+            app_id: Some("sentinel".into()),
+            ..Default::default()
+        },
+        |_, cx| cx.new(SentinelApp::new),
+    )
+    .expect("failed to open window")
 }

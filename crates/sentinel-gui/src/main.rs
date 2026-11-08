@@ -2,25 +2,21 @@
 //! renders state and forwards user actions, so it can be replaced without touching the backend.
 
 mod app;
+mod popout;
+mod screen;
+mod theme;
 
-use gpui::{App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{AnyWindowHandle, App, Application};
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1100.), px(760.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions { title: Some("Sentinel".into()), ..Default::default() }),
-                app_id: Some("sentinel".into()),
-                ..Default::default()
-            },
-            |_, cx| cx.new(app::SentinelApp::new),
-        )
-        .expect("failed to open window");
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
+        let main_window: AnyWindowHandle = app::open_main_window(cx).into();
+        // Closing the main window quits, even if the pop-out screen window is still open.
+        cx.on_window_closed(move |cx| {
+            if !cx.windows().contains(&main_window) {
+                // Quit from a separate task: quitting inside the platform's window-close
+                // handler panics on X11 (gpui re-borrows its client state).
+                cx.spawn(async move |cx| cx.update(|cx| cx.quit())).detach();
             }
         })
         .detach();
