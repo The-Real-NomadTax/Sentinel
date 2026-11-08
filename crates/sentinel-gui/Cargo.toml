@@ -1,0 +1,16 @@
+[package]
+name = "sentinel-gui"
+description = "GPUI frontend for Sentinel"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "sentinel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+sentinel-core.workspace = true
+gpui = "0.2.2"
+# Must match the versions gpui uses so RenderImage accepts our frames.
+image = { version = "0.25", default-features = false }

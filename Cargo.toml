@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/sentinel-core", "crates/sentinel-gui"]
+default-members = ["crates/sentinel-gui"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+sentinel-core = { path = "crates/sentinel-core" }
+
+[profile.dev.package."*"]
+# Decoding video in an unoptimized build is painfully slow; optimize deps even in dev.
+opt-level = 3

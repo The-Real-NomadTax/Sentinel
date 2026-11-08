@@ -1,0 +1,9 @@
+[package]
+name = "sentinel-core"
+description = "UI-agnostic ADB backend for Sentinel: devices, APK install, screen mirroring"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+openh264 = "0.9"
