@@ -7,6 +7,7 @@ fn main() -> anyhow::Result<()> {
     let devices = adb::list_devices()?;
     println!("devices: {devices:#?}");
     let device = devices.iter().find(|d| d.is_ready()).ok_or_else(|| anyhow::anyhow!("no ready device"))?;
+    println!("info: {:#?}", sentinel_core::device_info(&device.serial)?);
     let mirror = Mirror::start(&device.serial, MirrorConfig::default());
     let start = Instant::now();
     let mut last = None;

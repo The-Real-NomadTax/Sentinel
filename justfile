@@ -45,7 +45,11 @@ devices:
 
 # Remove leftover adb port forwards from killed mirroring sessions
 clean-forwards:
-    adb forward --list | awk '$3 ~ /^localabstract:scrcpy_/ {print $1, $2}' | while read -r serial port; do adb -s "$serial" forward --remove "$port"; done
+    adb forward --list | awk '$3 ~ /^localabstract:sentinel_/ {print $1, $2}' | while read -r serial port; do adb -s "$serial" forward --remove "$port"; done
+
+# Build just the on-device Kotlin agent (to agent/build/sentinel-agent.jar)
+agent:
+    agent/build.sh
 
 # Remove build artifacts
 clean:

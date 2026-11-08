@@ -1,36 +1,31 @@
 //! Screen mirroring.
 //!
-//! We reuse the small Java server that ships with scrcpy (`scrcpy-server`): it is pushed to the
-//! phone, started with `app_process`, and streams H.264 over an `adb forward` socket. We decode
-//! the stream with OpenH264 on a background thread and keep only the latest frame, so a slow
-//! frontend never builds up lag.
+//! Sentinel's own Kotlin agent (see [`crate::agent`]) is pushed to the phone, started with
+//! `app_process`, and streams H.264 over an `adb forward` socket; a second socket carries input.
+//! We decode the stream with OpenH264 on a background thread and keep only the latest frame, so
+//! a slow frontend never builds up lag.
 
 use std::{
     io::{BufRead, BufReader, Read},
     net::{Shutdown, TcpStream},
-    path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
+    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use openh264::{decoder::Decoder, formats::YUVSource};
 
-use crate::adb;
-
-const DEVICE_SERVER_PATH: &str = "/data/local/tmp/sentinel-scrcpy-server.jar";
-
-/// Where to look for `scrcpy-server` if none is configured.
-const SERVER_SEARCH_PATHS: &[&str] = &[
-    "/usr/share/scrcpy/scrcpy-server",
-    "/usr/local/share/scrcpy/scrcpy-server",
-    "/opt/homebrew/share/scrcpy/scrcpy-server",
-];
+use crate::{
+    adb, agent,
+    control::Controller,
+    media::{Recorder, RecordingStatus},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -46,11 +41,8 @@ pub struct MirrorConfig {
     pub bit_rate: u32,
     pub max_fps: u32,
     pub pixel_format: PixelFormat,
-    /// Path to `scrcpy-server`. Falls back to `SCRCPY_SERVER_PATH`, then common install paths.
-    pub server_path: Option<PathBuf>,
-    /// Version string the server expects (must match the server file exactly).
-    /// Falls back to parsing `scrcpy --version`.
-    pub server_version: Option<String>,
+    /// Accept input (touch, keys) from the computer. See [`Mirror::controller`].
+    pub control: bool,
 }
 
 impl Default for MirrorConfig {
@@ -60,8 +52,7 @@ impl Default for MirrorConfig {
             bit_rate: 8_000_000,
             max_fps: 60,
             pixel_format: PixelFormat::Rgba8,
-            server_path: None,
-            server_version: None,
+            control: true,
         }
     }
 }
@@ -93,6 +84,12 @@ struct Shared {
     frames_decoded: AtomicU64,
     /// Kept so `stop()` can unblock the reader thread.
     socket: Mutex<Option<TcpStream>>,
+    control_socket: Mutex<Option<TcpStream>>,
+    controller: Mutex<Option<Controller>>,
+    recorder: Mutex<Option<Recorder>>,
+    /// A recording finished because the session ended (e.g. the phone was unplugged),
+    /// waiting to be picked up by `stop_recording`.
+    finished_recording: Mutex<Option<Result<Vec<PathBuf>>>>,
     server: Mutex<Option<Child>>,
 }
 
@@ -150,6 +147,39 @@ impl Mirror {
         self.shared.latest.lock().unwrap().take()
     }
 
+    /// Send input to the device. `None` until connected, or if `control` was disabled.
+    pub fn controller(&self) -> Option<Controller> {
+        self.shared.controller.lock().unwrap().clone()
+    }
+
+    /// Start saving the stream to an MP4 file on this computer. Recording begins at the next
+    /// key frame (one is requested right away). A rotation continues in `<name>_2.mp4`, etc.
+    pub fn start_recording(&self, path: PathBuf) -> Result<()> {
+        let mut recorder = self.shared.recorder.lock().unwrap();
+        if recorder.is_some() {
+            bail!("already recording");
+        }
+        *recorder = Some(Recorder::new(path)?);
+        drop(recorder);
+        if let Some(ctl) = self.controller() {
+            ctl.request_key_frame();
+        }
+        Ok(())
+    }
+
+    /// Stop recording and finish the file(s). Also returns a recording that ended on its own
+    /// because the session stopped. `None` if there is nothing to report.
+    pub fn stop_recording(&self) -> Option<Result<Vec<PathBuf>>> {
+        if let Some(recorder) = self.shared.recorder.lock().unwrap().take() {
+            return Some(recorder.finish());
+        }
+        self.shared.finished_recording.lock().unwrap().take()
+    }
+
+    pub fn recording_status(&self) -> Option<RecordingStatus> {
+        self.shared.recorder.lock().unwrap().as_ref().map(Recorder::status)
+    }
+
     pub fn frames_decoded(&self) -> u64 {
         self.shared.frames_decoded.load(Ordering::Relaxed)
     }
@@ -170,8 +200,15 @@ impl Drop for Mirror {
 }
 
 fn cleanup(shared: &Shared) {
-    if let Some(socket) = shared.socket.lock().unwrap().take() {
-        let _ = socket.shutdown(Shutdown::Both);
+    // Finish any recording so the file is playable even if the frontend never stopped it.
+    if let Some(recorder) = shared.recorder.lock().unwrap().take() {
+        *shared.finished_recording.lock().unwrap() = Some(recorder.finish());
+    }
+    shared.controller.lock().unwrap().take();
+    for socket in [&shared.socket, &shared.control_socket] {
+        if let Some(socket) = socket.lock().unwrap().take() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
     }
     if let Some(mut child) = shared.server.lock().unwrap().take() {
         let _ = child.kill();
@@ -180,40 +217,35 @@ fn cleanup(shared: &Shared) {
 }
 
 fn run_session(serial: &str, config: &MirrorConfig, shared: &Shared) -> Result<()> {
-    let server_path = find_server(config)?;
-    let version = match &config.server_version {
-        Some(v) => v.clone(),
-        None => detect_server_version()?,
-    };
+    agent::push(serial)?;
 
-    adb::run(Some(serial), &["push", path_str(&server_path)?, DEVICE_SERVER_PATH])
-        .context("failed to push scrcpy-server to the device")?;
-
-    // A random id lets several sessions (or a real scrcpy) coexist on one device.
-    let scid = random_scid();
-    let socket_name = format!("scrcpy_{scid:08x}");
+    // A random socket name lets several sessions coexist on one device.
+    let socket_name = format!("sentinel_{:08x}", random_id());
     let port = adb::run(Some(serial), &["forward", "tcp:0", &format!("localabstract:{socket_name}")])?
         .trim()
         .parse::<u16>()
         .context("could not parse port from `adb forward`")?;
     let _forward = ForwardGuard { serial: serial.to_string(), port };
 
-    let server_cmd = format!(
-        "CLASSPATH={DEVICE_SERVER_PATH} app_process / com.genymobile.scrcpy.Server {version} \
-         scid={scid:08x} log_level=info tunnel_forward=true audio=false control=false \
-         cleanup=true video_codec=h264 max_size={} video_bit_rate={} max_fps={}",
-        config.max_size, config.bit_rate, config.max_fps
+    let agent_cmd = format!(
+        "CLASSPATH={path} app_process / {main} socket={socket_name} cleanup={path} \
+         max_size={} bit_rate={} max_fps={}",
+        config.max_size,
+        config.bit_rate,
+        config.max_fps,
+        path = agent::DEVICE_PATH,
+        main = agent::MAIN_CLASS,
     );
     let mut child = adb::command(Some(serial))
-        .args(["shell", &server_cmd])
+        .args(["shell", &agent_cmd])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to start scrcpy-server")?;
+        .context("failed to start the agent")?;
 
-    // Collect server output so failures show a useful message.
-    let server_log = Arc::new(Mutex::new(String::new()));
+    // Collect the agent's output so failures show a useful message.
+    let agent_log = Arc::new(Mutex::new(String::new()));
     for pipe in [
         child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
         child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
@@ -221,7 +253,7 @@ fn run_session(serial: &str, config: &MirrorConfig, shared: &Shared) -> Result<(
     .into_iter()
     .flatten()
     {
-        let log = server_log.clone();
+        let log = agent_log.clone();
         thread::spawn(move || {
             for line in BufReader::new(pipe).lines().map_while(Result::ok) {
                 let mut log = log.lock().unwrap();
@@ -232,42 +264,54 @@ fn run_session(serial: &str, config: &MirrorConfig, shared: &Shared) -> Result<(
     }
     *shared.server.lock().unwrap() = Some(child);
 
-    let mut stream = connect(port, shared).with_context(|| {
-        let log = server_log.lock().unwrap();
-        format!("could not connect to scrcpy-server. Server output:\n{}", log.trim())
+    let (mut stream, device_name) = connect(port, config.control, shared).with_context(|| {
+        let log = agent_log.lock().unwrap();
+        format!("could not connect to the agent. Agent output:\n{}", log.trim())
     })?;
 
-    let result = stream_video(&mut stream, config, &version, shared);
+    let result = stream_video(&mut stream, &device_name, config, shared);
     if result.is_err() && !shared.stop.load(Ordering::Relaxed) {
-        let log = server_log.lock().unwrap();
+        let log = agent_log.lock().unwrap();
         if !log.trim().is_empty() {
-            return result.with_context(|| format!("server output:\n{}", log.trim()));
+            return result.with_context(|| format!("agent output:\n{}", log.trim()));
         }
     }
     result
 }
 
-/// `adb forward` succeeds before the server is listening, so a connection can be accepted and
-/// immediately closed. The server writes one "dummy" byte once it is really ready.
-fn connect(port: u16, shared: &Shared) -> Result<TcpStream> {
+/// Connect the video socket, read the handshake, then connect the control socket.
+///
+/// `adb forward` accepts connections before the agent is listening and then closes them, so we
+/// retry until the handshake arrives.
+fn connect(port: u16, control: bool, shared: &Shared) -> Result<(TcpStream, String)> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             bail!("stopped");
         }
         if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-            let mut dummy = [0u8; 1];
-            if stream.read_exact(&mut dummy).is_ok() {
+            let mut magic = [0u8; 4];
+            if stream.read_exact(&mut magic).is_ok() {
+                if &magic != b"SNTL" {
+                    bail!("unexpected handshake {magic:02x?}");
+                }
+                let device_name = read_handshake(&mut stream)?;
                 stream.set_nodelay(true).ok();
                 *shared.socket.lock().unwrap() = Some(stream.try_clone()?);
-                return Ok(stream);
+                if control {
+                    let control = TcpStream::connect(("127.0.0.1", port)).context("connecting control socket")?;
+                    control.set_nodelay(true).ok();
+                    *shared.control_socket.lock().unwrap() = Some(control.try_clone()?);
+                    *shared.controller.lock().unwrap() = Some(Controller::spawn(control)?);
+                }
+                return Ok((stream, device_name));
             }
         }
-        // If the server already exited there's no point waiting.
+        // If the agent already exited there's no point waiting.
         if let Some(child) = shared.server.lock().unwrap().as_mut()
             && let Ok(Some(status)) = child.try_wait()
         {
-            bail!("scrcpy-server exited ({status})");
+            bail!("the agent exited ({status})");
         }
         if Instant::now() > deadline {
             bail!("timed out");
@@ -276,76 +320,72 @@ fn connect(port: u16, shared: &Shared) -> Result<TcpStream> {
     }
 }
 
-/// Wire format of the video socket. It changed in scrcpy 4.0.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Protocol {
-    /// Before 4.0: 12-byte codec header (id, width, height); config flag is bit 63.
-    Legacy,
-    /// 4.0 and later: 4-byte codec id; 12-byte "session" packets (bit 63 set) carry the size;
-    /// in media headers bit 62 = config, bit 61 = key frame.
-    V4,
+/// After the magic: version u8, name length u16, name.
+fn read_handshake(stream: &mut TcpStream) -> Result<String> {
+    let mut version = [0u8; 1];
+    stream.read_exact(&mut version)?;
+    if version[0] != agent::PROTOCOL_VERSION {
+        bail!("agent speaks protocol {}, expected {}", version[0], agent::PROTOCOL_VERSION);
+    }
+    let mut len = [0u8; 2];
+    stream.read_exact(&mut len)?;
+    let mut name = vec![0u8; u16::from_be_bytes(len) as usize];
+    stream.read_exact(&mut name)?;
+    Ok(String::from_utf8_lossy(&name).into_owned())
 }
 
-impl Protocol {
-    fn for_version(version: &str) -> Self {
-        let major = version.split('.').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
-        if major >= 4 { Protocol::V4 } else { Protocol::Legacy }
-    }
-}
+/// Packet header: flags+pts u64 (bit 63 session, bit 62 codec config, bit 61 key frame), length u32.
+const FLAG_SESSION: u64 = 1 << 63;
+const FLAG_CONFIG: u64 = 1 << 62;
+const FLAG_KEY_FRAME: u64 = 1 << 61;
+const PTS_MASK: u64 = (1 << 61) - 1;
 
-fn stream_video(stream: &mut TcpStream, config: &MirrorConfig, version: &str, shared: &Shared) -> Result<()> {
-    let protocol = Protocol::for_version(version);
-
-    // Device meta: 64-byte NUL-padded device name.
-    let mut name = [0u8; 64];
-    stream.read_exact(&mut name).context("reading device name")?;
-    let device_name = String::from_utf8_lossy(&name).trim_end_matches('\0').to_string();
-
-    let mut codec = [0u8; 4];
-    stream.read_exact(&mut codec).context("reading codec header")?;
-    if &codec != b"h264" {
-        bail!("unexpected codec {:?}", String::from_utf8_lossy(&codec));
-    }
-    if protocol == Protocol::Legacy {
-        let mut size = [0u8; 8]; // initial width + height; we take the size from decoded frames
-        stream.read_exact(&mut size)?;
-    }
-
+fn stream_video(stream: &mut TcpStream, device_name: &str, config: &MirrorConfig, shared: &Shared) -> Result<()> {
     let mut decoder = Decoder::new().context("failed to create H.264 decoder")?;
     let mut config_packet: Vec<u8> = Vec::new();
     let mut packet = Vec::new();
     let mut index = 0u64;
     let mut last_size = (0, 0);
+    // For recording: the current stream's SPS/PPS and frame size.
+    let mut stream_config: Vec<u8> = Vec::new();
+    let mut stream_size = (0u32, 0u32);
 
     while !shared.stop.load(Ordering::Relaxed) {
         let mut header = [0u8; 12];
         stream.read_exact(&mut header).context("stream ended")?;
         let flags = u64::from_be_bytes(header[0..8].try_into().unwrap());
-
-        let is_config = match protocol {
-            Protocol::Legacy => flags & (1 << 63) != 0,
-            Protocol::V4 => {
-                if flags & (1 << 63) != 0 {
-                    // Session packet (new capture session, e.g. after rotation). No payload.
-                    // A fresh decoder avoids artifacts from the old stream's state.
-                    decoder = Decoder::new().context("failed to create H.264 decoder")?;
-                    continue;
-                }
-                flags & (1 << 62) != 0
-            }
-        };
         let len = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
         if len > 64 * 1024 * 1024 {
             bail!("implausible packet size {len}; stream out of sync");
         }
-
         packet.resize(len, 0);
         stream.read_exact(&mut packet).context("stream ended mid-packet")?;
 
-        if is_config {
-            // SPS/PPS: feed it together with the next frame, like scrcpy does.
-            config_packet = packet.clone();
+        if flags & FLAG_SESSION != 0 {
+            // New capture session (e.g. after rotation); payload is the new frame size.
+            // A fresh decoder avoids artifacts from the old stream.
+            if packet.len() >= 8 {
+                stream_size = (
+                    u32::from_be_bytes(packet[0..4].try_into().unwrap()),
+                    u32::from_be_bytes(packet[4..8].try_into().unwrap()),
+                );
+            }
+            decoder = Decoder::new().context("failed to create H.264 decoder")?;
+            config_packet.clear();
+            stream_config.clear();
+            if let Some(rec) = shared.recorder.lock().unwrap().as_mut() {
+                rec.on_session();
+            }
             continue;
+        }
+        if flags & FLAG_CONFIG != 0 {
+            // SPS/PPS: feed it together with the next frame.
+            config_packet = packet.clone();
+            stream_config = packet.clone();
+            continue;
+        }
+        if let Some(rec) = shared.recorder.lock().unwrap().as_mut() {
+            rec.on_frame(&packet, flags & PTS_MASK, flags & FLAG_KEY_FRAME != 0, &stream_config, stream_size);
         }
         let data: &[u8] = if config_packet.is_empty() {
             &packet
@@ -384,7 +424,7 @@ fn stream_video(stream: &mut TcpStream, config: &MirrorConfig, version: &str, sh
             if (frame.width, frame.height) != last_size {
                 last_size = (frame.width, frame.height);
                 shared.set_status(MirrorStatus::Streaming {
-                    device_name: device_name.clone(),
+                    device_name: device_name.to_string(),
                     width: frame.width,
                     height: frame.height,
                 });
@@ -406,47 +446,7 @@ impl Drop for ForwardGuard {
     }
 }
 
-fn find_server(config: &MirrorConfig) -> Result<PathBuf> {
-    let candidates = config
-        .server_path
-        .clone()
-        .into_iter()
-        .chain(std::env::var_os("SCRCPY_SERVER_PATH").map(PathBuf::from))
-        .chain(SERVER_SEARCH_PATHS.iter().map(PathBuf::from));
-    for path in candidates {
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    bail!(
-        "scrcpy-server not found. Install scrcpy, or set SCRCPY_SERVER_PATH to the scrcpy-server file"
-    )
-}
-
-/// The server refuses to start unless the client passes its exact version.
-fn detect_server_version() -> Result<String> {
-    if let Ok(v) = std::env::var("SCRCPY_SERVER_VERSION") {
-        return Ok(v);
-    }
-    let out = std::process::Command::new("scrcpy")
-        .arg("--version")
-        .output()
-        .context("could not run `scrcpy --version` to detect the server version; set SCRCPY_SERVER_VERSION")?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .next()
-        .and_then(|line| line.strip_prefix("scrcpy "))
-        .and_then(|rest| rest.split_whitespace().next())
-        .map(str::to_string)
-        .context("could not parse `scrcpy --version`; set SCRCPY_SERVER_VERSION")
-}
-
-fn random_scid() -> u32 {
+fn random_id() -> u32 {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    // 31 bits: the server parses scid as a signed int.
-    ((nanos as u32) ^ std::process::id().rotate_left(16)) & 0x7fff_ffff
-}
-
-fn path_str(path: &Path) -> Result<&str> {
-    path.to_str().context("path is not valid UTF-8")
+    (nanos as u32) ^ std::process::id().rotate_left(16)
 }

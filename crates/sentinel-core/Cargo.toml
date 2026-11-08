@@ -6,4 +6,8 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
+mp4 = "0.14"
 openh264 = "0.9"
