@@ -1,6 +1,6 @@
 //! Shared colors and small widgets used by every window.
 
-use gpui::{ClickEvent, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, rgb};
+use gpui::{ClickEvent, ElementId, IntoElement, ParentElement, SharedString, Styled, Window, div, prelude::*, rgb};
 
 pub const BG: u32 = 0x111318;
 pub const SIDEBAR: u32 = 0x15171d;
@@ -22,7 +22,7 @@ pub fn section_label(text: &'static str) -> impl IntoElement {
 
 /// A full-width button. `secondary` draws it in the muted style.
 pub fn button(
-    id: &'static str,
+    id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     enabled: bool,
     secondary: bool,
@@ -33,7 +33,7 @@ pub fn button(
 
 /// A full-width button with a custom background color.
 pub fn colored_button(
-    id: &'static str,
+    id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     enabled: bool,
     color: u32,

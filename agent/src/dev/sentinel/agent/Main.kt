@@ -12,6 +12,8 @@
 //              low 61 bits = presentation time in microseconds
 //
 // control socket (desktop -> agent), see Input.kt for message layouts.
+//
+// With `mode=apps` the agent instead prints the installed apps to stdout and exits (Apps.kt).
 package dev.sentinel.agent
 
 import android.net.LocalServerSocket
@@ -31,6 +33,22 @@ object Main {
             val parts = arg.split("=", limit = 2)
             if (parts.size == 2) parts[0] to parts[1] else null
         }.toMap()
+
+        // Delete our own jar: the classes are already loaded, and nothing is left behind.
+        opts["cleanup"]?.let { File(it).delete() }
+
+        if (opts["mode"] == "apps") {
+            Workarounds.apply()
+            try {
+                Apps.list()
+            } catch (e: Throwable) {
+                log("fatal: $e")
+                e.printStackTrace()
+                exitProcess(1)
+            }
+            exitProcess(0)
+        }
+
         val socketName = opts["socket"] ?: run {
             log("missing socket=<name>")
             exitProcess(2)
@@ -38,9 +56,6 @@ object Main {
         val maxSize = opts["max_size"]?.toIntOrNull() ?: 1280
         val bitRate = opts["bit_rate"]?.toIntOrNull() ?: 8_000_000
         val maxFps = opts["max_fps"]?.toIntOrNull() ?: 60
-
-        // Delete our own jar: the classes are already loaded, and nothing is left behind.
-        opts["cleanup"]?.let { File(it).delete() }
 
         Workarounds.apply()
 

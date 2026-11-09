@@ -1,7 +1,7 @@
 //! Thin, blocking wrappers around the `adb` command-line tool.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -109,6 +109,35 @@ pub fn install_apk(serial: &str, apk: &Path) -> Result<String> {
         bail!("install failed: {}", out.trim());
     }
     Ok(out.trim().to_string())
+}
+
+/// Install an app split into several APKs (a base APK plus splits) in one go, e.g. a folder
+/// exported by [`crate::apps::export_app`]. Blocks until done.
+pub fn install_apks(serial: &str, apks: &[PathBuf]) -> Result<String> {
+    if apks.is_empty() {
+        bail!("no APK files to install");
+    }
+    let mut args = vec!["install-multiple".to_string(), "-r".to_string()];
+    for apk in apks {
+        args.push(apk.to_str().context("APK path is not valid UTF-8")?.to_string());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run(Some(serial), &args)?;
+    if !out.contains("Success") {
+        bail!("install failed: {}", out.trim());
+    }
+    Ok(out.trim().to_string())
+}
+
+/// The `.apk` files directly inside `dir`, sorted (`base.apk` sorts before `split_*.apk`).
+pub fn apks_in_dir(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut apks: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("apk")))
+        .collect();
+    apks.sort();
+    Ok(apks)
 }
 
 #[cfg(test)]

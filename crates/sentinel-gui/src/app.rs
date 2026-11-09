@@ -7,7 +7,7 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClickEvent, Context, ExternalPaths, FocusHandle, IntoElement,
+    AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity, ExternalPaths, FocusHandle, IntoElement,
     ParentElement, PathPromptOptions, Render, RenderImage, SharedString, Styled, TitlebarOptions,
     Window, WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, rgb, size,
 };
@@ -16,6 +16,7 @@ use sentinel_core::{
 };
 
 use crate::{
+    apps::AppsPanel,
     dashboard,
     popout::PopoutWindow,
     screen::{self, ScreenState},
@@ -30,6 +31,7 @@ const INFO_POLL: Duration = Duration::from_secs(5);
 enum Tab {
     Dashboard,
     Screen,
+    Apps,
 }
 
 enum InstallState {
@@ -64,6 +66,8 @@ pub struct SentinelApp {
     /// A pop-out window has been requested but not opened yet.
     popout_opening: bool,
     installs: Vec<InstallJob>,
+    /// The Apps tab (installed apps and APK export).
+    apps: Entity<AppsPanel>,
     tab: Tab,
     /// Dashboard data for the selected device.
     info: Option<DeviceInfo>,
@@ -101,6 +105,7 @@ impl SentinelApp {
             popout: None,
             popout_opening: false,
             installs: Vec::new(),
+            apps: cx.new(AppsPanel::new),
             tab: Tab::Dashboard,
             info: None,
             info_error: None,
@@ -225,6 +230,7 @@ impl SentinelApp {
                 if fetch_now {
                     self.refresh_info(cx);
                 }
+                self.sync_apps_device(cx);
             }
             Err(err) => {
                 self.device_error = Some(format!("{err:#}"));
@@ -265,8 +271,25 @@ impl SentinelApp {
             self.info = None;
             self.info_error = None;
             self.refresh_info(cx);
+            self.sync_apps_device(cx);
             cx.notify();
         }
+    }
+
+    /// Tell the Apps tab which device to list (only once it's ready to talk to).
+    fn sync_apps_device(&mut self, cx: &mut Context<Self>) {
+        let ready = self.selected.clone().filter(|s| self.devices.iter().any(|d| &d.serial == s && d.is_ready()));
+        self.apps.update(cx, |apps, cx| apps.set_device(ready, cx));
+    }
+
+    fn show_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = tab;
+        if tab == Tab::Apps {
+            // Typing goes straight into the search box.
+            let focus = self.apps.read(cx).search_focus.clone();
+            window.focus(&focus);
+        }
+        cx.notify();
     }
 
     fn toggle_mirror(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -566,6 +589,11 @@ impl SentinelApp {
         let Some(serial) = self.selected.clone() else { return };
         for path in paths {
             let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if path.is_dir() {
+                // A folder of split APKs, e.g. one exported from the Apps tab.
+                self.install_split(serial.clone(), path, file_name, cx);
+                continue;
+            }
             if !file_name.to_lowercase().ends_with(".apk") {
                 self.installs.push(InstallJob {
                     file_name,
@@ -594,6 +622,32 @@ impl SentinelApp {
             .detach();
         }
         cx.notify();
+    }
+
+    fn install_split(&mut self, serial: String, dir: PathBuf, file_name: String, cx: &mut Context<Self>) {
+        let ix = self.installs.len();
+        self.installs.push(InstallJob { file_name: format!("{file_name}/"), state: InstallState::Running });
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let apks = adb::apks_in_dir(&dir)?;
+                    if apks.is_empty() {
+                        anyhow::bail!("no .apk files in this folder");
+                    }
+                    adb::install_apks(&serial, &apks)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.installs[ix].state = match result {
+                    Ok(_) => InstallState::Done,
+                    Err(err) => InstallState::Failed(format!("{err:#}")),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- rendering --------------------------------------------------------------------
@@ -709,7 +763,19 @@ impl SentinelApp {
             )
             .child(section_label("Apps"))
             .child(button("install", "Install APK…", has_device, false, cx.listener(Self::pick_apks)))
-            .child(div().text_xs().text_color(rgb(MUTED)).child("…or drop .apk files anywhere on the window"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("…or drop .apk files (or a folder of split APKs) anywhere on the window"),
+            )
+            .child(button(
+                "export-apks",
+                "Export installed APKs…",
+                has_device,
+                true,
+                cx.listener(|this, _, window, cx| this.show_tab(Tab::Apps, window, cx)),
+            ))
             .child(div().flex().flex_col().gap_1().children(installs))
     }
 
@@ -726,10 +792,7 @@ impl SentinelApp {
                 .text_color(rgb(if active { TEXT } else { MUTED }))
                 .cursor_pointer()
                 .hover(|s| s.text_color(rgb(TEXT)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.tab = which;
-                    cx.notify();
-                }))
+                .on_click(cx.listener(move |this, _, window, cx| this.show_tab(which, window, cx)))
                 .child(label)
         };
         let tabs = div()
@@ -739,11 +802,13 @@ impl SentinelApp {
             .border_b_1()
             .border_color(rgb(BORDER))
             .child(tab("tab-dashboard", "Dashboard", Tab::Dashboard, cx))
-            .child(tab("tab-screen", "Screen", Tab::Screen, cx));
+            .child(tab("tab-screen", "Screen", Tab::Screen, cx))
+            .child(tab("tab-apps", "Apps", Tab::Apps, cx));
 
         let content = match self.tab {
             Tab::Dashboard => dashboard::render(self.info.as_ref(), self.info_error.as_deref(), self.selected.is_some()),
             Tab::Screen => self.render_screen_tab(cx),
+            Tab::Apps => self.apps.clone().into_any_element(),
         };
         div()
             .size_full()

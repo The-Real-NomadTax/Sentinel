@@ -50,6 +50,21 @@ Both are saved on the computer; nothing is written to the phone.
   at the mirroring resolution (1280px on the long side) and only contain frames when the screen
   changes, so a still screen holds its last frame.
 
+## Exporting installed apps
+
+The **Apps** tab (or **Export installed APKs…** in the sidebar) lists the phone's apps with their
+real names, versions and sizes. Type to search; tick **System apps** to include preinstalled ones.
+**Export APK** copies the app's APK files to `~/Downloads/Sentinel/` with `adb pull`:
+
+- An app installed as a single APK is saved as `Name_version.apk`.
+- An app split into several APKs (most Play Store apps) is saved as a folder `Name_version/` with
+  `base.apk` and its `split_*.apk` files. Drop that folder on the window to install it again
+  (`adb install-multiple`).
+
+Exports never overwrite: a second export of the same version gets a `(2)` suffix. App names come
+from the agent, run once with `mode=apps`; if it can't run, the list falls back to
+`pm list packages` and shows package names only.
+
 ## How mirroring works
 
 Sentinel ships its own small Kotlin agent (`agent/`, about 30 KB once compiled). `cargo build`

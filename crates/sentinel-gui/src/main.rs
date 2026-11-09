@@ -2,6 +2,7 @@
 //! renders state and forwards user actions, so it can be replaced without touching the backend.
 
 mod app;
+mod apps;
 mod dashboard;
 mod input;
 mod popout;

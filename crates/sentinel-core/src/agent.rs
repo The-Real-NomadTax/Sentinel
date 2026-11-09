@@ -17,14 +17,23 @@ pub const JAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sentinel-agent.
 /// Where the agent is placed on the device.
 pub const DEVICE_PATH: &str = "/data/local/tmp/sentinel-agent.jar";
 
+/// Where a short-lived agent (e.g. listing apps) is placed, so it never races a mirroring
+/// session's copy, which deletes itself on start.
+pub const TASK_DEVICE_PATH: &str = "/data/local/tmp/sentinel-agent-task.jar";
+
 /// Entry point class started by `app_process`.
 pub const MAIN_CLASS: &str = "dev.sentinel.agent.Main";
 
 /// Protocol version the agent speaks; checked in the handshake.
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// Copy the agent to the device.
+/// Copy the agent to [`DEVICE_PATH`] on the device.
 pub fn push(serial: &str) -> Result<()> {
+    push_to(serial, DEVICE_PATH)
+}
+
+/// Copy the agent to `device_path` on the device.
+pub fn push_to(serial: &str, device_path: &str) -> Result<()> {
     // `adb push` needs a file on disk; name it by content so concurrent sessions share it.
     let mut hasher = DefaultHasher::new();
     JAR.hash(&mut hasher);
@@ -33,6 +42,6 @@ pub fn push(serial: &str) -> Result<()> {
         std::fs::write(&local, JAR).with_context(|| format!("writing {}", local.display()))?;
     }
     let local = local.to_str().context("temp path is not valid UTF-8")?;
-    adb::run(Some(serial), &["push", local, DEVICE_PATH]).context("failed to push the agent to the device")?;
+    adb::run(Some(serial), &["push", local, device_path]).context("failed to push the agent to the device")?;
     Ok(())
 }

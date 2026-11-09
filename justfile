@@ -39,6 +39,10 @@ probe:
 install apk:
     cargo run --release -p sentinel-core --example install -- "$1"
 
+# Headless check of app listing; pass package names to also export them to a temp folder
+apps *packages:
+    cargo run --release -p sentinel-core --example apps_probe -- "$@"
+
 # Show connected devices
 devices:
     adb devices -l
