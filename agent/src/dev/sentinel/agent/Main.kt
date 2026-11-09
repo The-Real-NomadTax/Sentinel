@@ -11,12 +11,16 @@
 //              bit 61 = key frame
 //              low 61 bits = presentation time in microseconds
 //
-// control socket (desktop -> agent), see Input.kt for message layouts.
+// control socket (desktop -> agent), see Input.kt for message layouts. Not opened with
+// `control=0` (view only).
+//
+// Only connections from adbd (the shell or root user) are accepted; see acceptFromAdb.
 //
 // With `mode=apps` the agent instead prints the installed apps to stdout and exits (Apps.kt).
 package dev.sentinel.agent
 
 import android.net.LocalServerSocket
+import android.net.LocalSocket
 import java.io.BufferedOutputStream
 import java.io.DataOutputStream
 import java.io.File
@@ -56,11 +60,13 @@ object Main {
         val maxSize = opts["max_size"]?.toIntOrNull() ?: 1280
         val bitRate = opts["bit_rate"]?.toIntOrNull() ?: 8_000_000
         val maxFps = opts["max_fps"]?.toIntOrNull() ?: 60
+        // control=0: view only; the desktop never opens the control socket.
+        val control = opts["control"] != "0"
 
         Workarounds.apply()
 
         try {
-            run(socketName, maxSize, bitRate, maxFps)
+            run(socketName, maxSize, bitRate, maxFps, control)
         } catch (e: Throwable) {
             log("fatal: $e")
             e.printStackTrace()
@@ -69,13 +75,13 @@ object Main {
         exitProcess(0)
     }
 
-    private fun run(socketName: String, maxSize: Int, bitRate: Int, maxFps: Int) {
+    private fun run(socketName: String, maxSize: Int, bitRate: Int, maxFps: Int, control: Boolean) {
         val server = LocalServerSocket(socketName)
         log("listening on @$socketName")
 
         // The desktop connects the video socket first and waits for the handshake,
-        // then connects the control socket.
-        val videoSocket = server.accept()
+        // then (unless view-only) connects the control socket.
+        val videoSocket = acceptFromAdb(server)
         val video = DataOutputStream(BufferedOutputStream(videoSocket.outputStream, 1 shl 16))
         val name = (android.os.Build.MODEL ?: "Android").toByteArray(Charsets.UTF_8)
         video.write("SNTL".toByteArray(Charsets.US_ASCII))
@@ -84,22 +90,42 @@ object Main {
         video.write(name)
         video.flush()
 
-        val controlSocket = server.accept()
+        val controlSocket = if (control) acceptFromAdb(server) else null
         server.close()
 
         val streamer = ScreenStreamer(video, maxSize, bitRate, maxFps)
-        val input = InputHandler(streamer)
 
         // When the desktop goes away either socket fails; then we're done.
-        Thread({
-            try {
-                input.serve(controlSocket.inputStream)
-            } catch (e: Exception) {
-                log("control closed: $e")
-            }
-            exitProcess(0)
-        }, "sentinel-control").start()
+        if (controlSocket != null) {
+            val input = InputHandler(streamer)
+            Thread({
+                try {
+                    input.serve(controlSocket.inputStream)
+                } catch (e: Exception) {
+                    log("control closed: $e")
+                }
+                exitProcess(0)
+            }, "sentinel-control").start()
+        }
 
         streamer.run() // returns only when the video socket fails
     }
+
+    /**
+     * Accept the next connection that comes through `adb forward`. The socket lives in the
+     * abstract namespace, which has no file permissions, so any app on the phone could connect;
+     * only adbd (running as shell, or root after `adb root`) may watch the screen or send input.
+     */
+    private fun acceptFromAdb(server: LocalServerSocket): LocalSocket {
+        while (true) {
+            val socket = server.accept()
+            val uid = runCatching { socket.peerCredentials.uid }.getOrDefault(-1)
+            if (uid == SHELL_UID || uid == ROOT_UID) return socket
+            log("rejected a connection from uid $uid")
+            runCatching { socket.close() }
+        }
+    }
+
+    private const val SHELL_UID = 2000
+    private const val ROOT_UID = 0
 }

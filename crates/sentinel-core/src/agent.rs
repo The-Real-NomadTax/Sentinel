@@ -3,7 +3,8 @@
 //! with `app_process` for each mirroring session, and deletes itself once started.
 
 use std::{
-    hash::{DefaultHasher, Hash, Hasher},
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, DefaultHasher, Hash, Hasher},
     path::PathBuf,
 };
 
@@ -14,22 +15,28 @@ use crate::adb;
 /// The compiled agent.
 pub const JAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sentinel-agent.jar"));
 
-/// Where the agent is placed on the device.
-pub const DEVICE_PATH: &str = "/data/local/tmp/sentinel-agent.jar";
-
-/// Where a short-lived agent (e.g. listing apps) is placed, so it never races a mirroring
-/// session's copy, which deletes itself on start.
-pub const TASK_DEVICE_PATH: &str = "/data/local/tmp/sentinel-agent-task.jar";
-
 /// Entry point class started by `app_process`.
 pub const MAIN_CLASS: &str = "dev.sentinel.agent.Main";
 
 /// Protocol version the agent speaks; checked in the handshake.
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// Copy the agent to [`DEVICE_PATH`] on the device.
-pub fn push(serial: &str) -> Result<()> {
-    push_to(serial, DEVICE_PATH)
+/// A random 64-bit id, seeded from the OS (std's `RandomState`), for socket and file names.
+pub(crate) fn random_id() -> u64 {
+    RandomState::new().hash_one(std::process::id())
+}
+
+/// Where one agent run keeps its jar on the device. Every run gets its own file, because the
+/// agent deletes its jar as soon as it starts: a shared path would let one run delete the
+/// file another run is about to load (e.g. two Sentinel windows on the same phone).
+pub fn device_path(id: &str) -> String {
+    format!("/data/local/tmp/sentinel-agent-{id}.jar")
+}
+
+/// Remove a jar left behind by a run that never started (best effort; the agent normally
+/// deletes its own).
+pub fn remove(serial: &str, device_path: &str) {
+    let _ = adb::run(Some(serial), &["shell", &format!("rm -f {device_path}")]);
 }
 
 /// Copy the agent to `device_path` on the device.

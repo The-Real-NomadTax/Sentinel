@@ -1,6 +1,6 @@
 //! Translating desktop keyboard input into phone input.
 
-use gpui::Keystroke;
+use gpui::{App, Keystroke};
 use sentinel_core::{
     Controller,
     control::{keycode, meta},
@@ -8,10 +8,21 @@ use sentinel_core::{
 
 /// Forward a key press to the phone. Returns `false` for keys left to Sentinel itself
 /// (Ctrl+Q) or that have no phone equivalent.
-pub fn forward_key(ctl: &Controller, ks: &Keystroke) -> bool {
+pub fn forward_key(ctl: &Controller, ks: &Keystroke, cx: &App) -> bool {
     let m = &ks.modifiers;
     if (m.control || m.platform) && ks.key == "q" {
         return false;
+    }
+
+    // Ctrl+V (Cmd+V on macOS) pastes this computer's clipboard on the phone. With nothing
+    // usable on it, it falls through to the phone's own Ctrl+V below.
+    if (m.control || m.platform) && !m.alt && !m.shift && ks.key == "v" {
+        let text = cx.read_from_clipboard().and_then(|c| c.text()).filter(|t| !t.is_empty());
+        if let Some(text) = text
+            && ctl.set_clipboard(&text, true)
+        {
+            return true;
+        }
     }
 
     let mut metastate = 0;

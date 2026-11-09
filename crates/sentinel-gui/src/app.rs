@@ -81,6 +81,9 @@ pub struct SentinelApp {
     record_when_ready: bool,
     /// Last repaint for the recording timer.
     last_tick: Instant,
+    /// The current mirror session has ended and that has been handled (so it's done once,
+    /// not on every frame poll).
+    mirror_end_handled: bool,
     _quit_subscription: gpui::Subscription,
 }
 
@@ -115,6 +118,7 @@ impl SentinelApp {
             screenshot_in_flight: false,
             record_when_ready: false,
             last_tick: Instant::now(),
+            mirror_end_handled: false,
             _quit_subscription: quit,
         }
     }
@@ -213,6 +217,9 @@ impl SentinelApp {
                 let still_there =
                     self.selected.as_ref().is_some_and(|s| devices.iter().any(|d| &d.serial == s));
                 if !still_there {
+                    // The mirrored device is gone: end its session (this also saves any
+                    // recording) rather than leaving a dead mirror attached to the new selection.
+                    self.stop_mirror(cx);
                     self.selected = devices.iter().find(|d| d.is_ready()).map(|d| d.serial.clone());
                     self.info = None;
                     self.info_error = None;
@@ -254,10 +261,13 @@ impl SentinelApp {
                 cx.drop_image(old, None);
             }
             cx.notify();
-        } else if !matches!(mirror.status(), MirrorStatus::Streaming { .. } | MirrorStatus::Starting) {
-            // The session ended (e.g. phone unplugged): report any recording it finished.
+        } else if !self.mirror_end_handled
+            && !matches!(mirror.status(), MirrorStatus::Streaming { .. } | MirrorStatus::Starting)
+        {
+            // The session ended (e.g. phone unplugged): report any recording it finished, and
+            // repaint once so the failure/stop message shows up.
+            self.mirror_end_handled = true;
             self.stop_recording(cx);
-            // Repaint once so a failure/stop message shows up.
             cx.notify();
         }
     }
@@ -306,6 +316,7 @@ impl SentinelApp {
         // GPUI textures are BGRA, so ask core to convert while decoding.
         let config = MirrorConfig { pixel_format: PixelFormat::Bgra8, ..Default::default() };
         self.mirror = Some(Mirror::start(serial, config));
+        self.mirror_end_handled = false;
     }
 
     fn stop_mirror(&mut self, cx: &mut Context<Self>) {

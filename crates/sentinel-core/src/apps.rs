@@ -59,13 +59,13 @@ pub fn list_apps(serial: &str) -> Result<Vec<AppInfo>> {
 }
 
 fn list_with_agent(serial: &str) -> Result<Vec<AppInfo>> {
-    agent::push_to(serial, agent::TASK_DEVICE_PATH)?;
-    let cmd = format!(
-        "CLASSPATH={path} app_process / {main} mode=apps cleanup={path}",
-        path = agent::TASK_DEVICE_PATH,
-        main = agent::MAIN_CLASS,
-    );
-    let output = adb::command(Some(serial)).args(["shell", &cmd]).output().context("failed to run the agent")?;
+    let path = agent::device_path(&format!("apps_{:016x}", agent::random_id()));
+    agent::push_to(serial, &path)?;
+    let cmd = format!("CLASSPATH={path} app_process / {main} mode=apps cleanup={path}", main = agent::MAIN_CLASS);
+    let output = adb::command(Some(serial)).args(["shell", &cmd]).output();
+    // The agent deletes its jar when it starts; this covers a run that failed before that.
+    agent::remove(serial, &path);
+    let output = output.context("failed to run the agent")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let apps = parse_agent_output(&stdout);
     if apps.is_empty() {

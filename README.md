@@ -10,7 +10,10 @@ screenshots and screen recording saved on your computer, and APK install. Ctrl+Q
 - **Scroll wheel**: scroll
 - **Right-click**: Back · **Middle-click**: Home
 - **Typing**: click the screen first (it gets a blue outline), then type; Enter, Backspace,
-  arrows, Tab, Esc and Ctrl+letter shortcuts (Ctrl+A/C/V…) work
+  arrows, Tab, Esc and Ctrl+letter shortcuts (Ctrl+A/C/X…) work on the phone
+- **Ctrl+V** pastes your computer's clipboard on the phone. Text the phone's virtual keyboard
+  can't type (accented letters, CJK, emoji…) is pasted the same way. Both replace what was on
+  the phone's clipboard. Copying on the phone (Ctrl+C) stays on the phone; it isn't sent back.
 - Buttons under the screen: Back, Home, Recents, Volume −/+, Power
 
 ## Layout
@@ -22,8 +25,8 @@ crates/
   sentinel-gui/    GPUI frontend (binary: `sentinel`)
 ```
 
-The frontend only uses `sentinel-core`'s public API (`adb::list_devices`, `adb::install_apk`,
-`device_info`, `Mirror::start` / `take_frame` / `status`). To try a different UI toolkit, add a new crate that
+The frontend only uses `sentinel-core`'s public API (`adb`, `device_info`, `apps`, `media`,
+`Mirror` and its `Controller`). To try a different UI toolkit, add a new crate that
 depends on `sentinel-core`; nothing in core needs to change.
 
 ## Requirements
@@ -76,7 +79,10 @@ and talks to it over an `adb forward` tunnel:
   Sentinel decodes it with OpenH264.
 - **control**: touches, scrolling, keys and text, injected through Android's input manager.
 
-The agent deletes its jar as soon as it starts and exits when Sentinel disconnects. To build
+Each run gets its own jar (`/data/local/tmp/sentinel-agent-<id>.jar`), which the agent deletes
+as soon as it starts; it exits when Sentinel disconnects. The tunnel ends in an abstract socket
+that any app on the phone could open, so the agent only accepts connections from adbd (the
+shell or root user). To build
 without the Android toolchain, point `SENTINEL_AGENT_JAR` at a prebuilt `sentinel-agent.jar`.
 
 ## Run

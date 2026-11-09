@@ -9,7 +9,11 @@
 //! 3 KEY     action u8 (0 down, 1 up) | keycode i32 | meta state i32
 //! 4 TEXT    length i32 | UTF-8 bytes
 //! 5 KEY_FRAME_REQUEST  (no payload): encode a key frame now, e.g. to start a recording
+//! 6 CLIPBOARD  paste u8 (1 = also paste it into the focused field) | length i32 | UTF-8 bytes
 //! ```
+//!
+//! TEXT the phone's virtual keyboard can't type (accented letters, CJK, emoji…) is pasted
+//! through the phone's clipboard instead, which replaces what was on it.
 
 use std::{
     io::{Read, Write},
@@ -73,9 +77,14 @@ const MSG_SCROLL: u8 = 2;
 const MSG_KEY: u8 = 3;
 const MSG_TEXT: u8 = 4;
 const MSG_KEY_FRAME_REQUEST: u8 = 5;
+const MSG_CLIPBOARD: u8 = 6;
 
 /// Keep text messages small so one long paste doesn't stall touch events behind it.
 const TEXT_CHUNK_BYTES: usize = 300;
+
+/// Largest clipboard text sent to the phone. Android passes the clip through a binder call,
+/// which fails for transactions approaching 1 MB.
+pub const MAX_CLIPBOARD_BYTES: usize = 256 * 1024;
 
 /// A handle for sending input to a mirrored device. Cheap to clone; sending never blocks.
 ///
@@ -145,6 +154,16 @@ impl Controller {
         }
     }
 
+    /// Put `text` on the phone's clipboard and, if `paste`, paste it into the focused field.
+    /// Returns `false` (sending nothing) if the text is longer than [`MAX_CLIPBOARD_BYTES`].
+    pub fn set_clipboard(&self, text: &str, paste: bool) -> bool {
+        if text.len() > MAX_CLIPBOARD_BYTES {
+            return false;
+        }
+        self.send(encode_clipboard(text, paste));
+        true
+    }
+
     /// Ask the agent to encode a key frame now.
     pub fn request_key_frame(&self) {
         self.send(vec![MSG_KEY_FRAME_REQUEST]);
@@ -196,6 +215,15 @@ fn encode_text(text: &str) -> Vec<u8> {
     b
 }
 
+fn encode_clipboard(text: &str, paste: bool) -> Vec<u8> {
+    let mut b = Vec::with_capacity(6 + text.len());
+    b.push(MSG_CLIPBOARD);
+    b.push(u8::from(paste));
+    b.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    b.extend_from_slice(text.as_bytes());
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +258,23 @@ mod tests {
         let mut expected = vec![4, 0, 0, 0, 13];
         expected.extend_from_slice(b"hello, world!");
         assert_eq!(encode_text("hello, world!"), expected);
+    }
+
+    #[test]
+    fn clipboard_layout() {
+        let mut expected = vec![6, 1, 0, 0, 0, 5];
+        expected.extend_from_slice("café".as_bytes());
+        assert_eq!(encode_clipboard("café", true), expected);
+        assert_eq!(encode_clipboard("", false), [6, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn oversized_clipboard_is_not_sent() {
+        let (tx, rx) = mpsc::channel();
+        let controller = Controller { tx };
+        assert!(!controller.set_clipboard(&"x".repeat(MAX_CLIPBOARD_BYTES + 1), true));
+        assert!(controller.set_clipboard("hi", true));
+        assert_eq!(rx.try_iter().count(), 1);
     }
 
     #[test]
