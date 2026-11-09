@@ -17,6 +17,7 @@ import java.lang.reflect.Method
  *   3 KEY     action u8 (0 down, 1 up) | keycode i32 | meta state i32
  *   4 TEXT    length i32 | UTF-8 bytes
  *   5 KEY_FRAME_REQUEST  (no payload)
+ *   6 CLIPBOARD  paste u8 (1 = also paste it into the focused field) | length i32 | UTF-8 bytes
  * Positions are in the pixel space of the video frame the desktop is showing; events for a
  * frame size that no longer matches (mid-rotation) are dropped.
  */
@@ -32,12 +33,12 @@ class InputHandler(private val streamer: ScreenStreamer) {
                 1 -> touch(input.readUnsignedByte(), input.readInt(), input.readInt(), input.readUnsignedShort(), input.readUnsignedShort())
                 2 -> scroll(input.readInt(), input.readInt(), input.readUnsignedShort(), input.readUnsignedShort(), input.readFloat(), input.readFloat())
                 3 -> key(input.readUnsignedByte(), input.readInt(), input.readInt())
-                4 -> {
-                    val bytes = ByteArray(input.readInt())
-                    input.readFully(bytes)
-                    text(String(bytes, Charsets.UTF_8))
-                }
+                4 -> text(readString(input))
                 5 -> streamer.requestKeyFrame()
+                6 -> {
+                    val paste = input.readUnsignedByte() != 0
+                    clipboard(readString(input), paste)
+                }
                 else -> throw IllegalStateException("unknown control message $type")
             }
         }
@@ -100,15 +101,66 @@ class InputHandler(private val streamer: ScreenStreamer) {
         )
     }
 
-    private fun text(text: String) {
-        for (ch in text) {
-            // Characters the virtual keyboard map can't produce are skipped.
-            val events = keyMap.getEvents(charArrayOf(ch)) ?: continue
-            for (e in events) {
-                val now = SystemClock.uptimeMillis()
-                injector.inject(KeyEvent.changeTimeRepeat(e, now, 0))
-            }
+    /**
+     * Press Paste and wait until the app has handled it, so the next clipboard change (e.g.
+     * the next typed character) can't replace the clip before the app reads it.
+     */
+    private fun pressPaste() {
+        for (action in intArrayOf(KeyEvent.ACTION_DOWN, KeyEvent.ACTION_UP)) {
+            val now = SystemClock.uptimeMillis()
+            injector.inject(
+                KeyEvent(now, now, action, KeyEvent.KEYCODE_PASTE, 0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD),
+                waitForFinish = true,
+            )
         }
+    }
+
+    private fun readString(input: DataInputStream): String {
+        val bytes = ByteArray(input.readInt())
+        input.readFully(bytes)
+        return String(bytes, Charsets.UTF_8)
+    }
+
+    private fun text(text: String) {
+        // `getEvents` returns null if any character can't be typed on the virtual keyboard.
+        val events = keyMap.getEvents(text.toCharArray())
+        if (events != null) {
+            injectAll(events)
+            return
+        }
+        // Accented letters, CJK, emoji…: paste them through the clipboard instead.
+        if (Clipboard.set(text)) {
+            pressPaste()
+            return
+        }
+        typeWhatWeCan(text)
+    }
+
+    /** The desktop's clipboard, optionally pasted into the focused field (desktop Ctrl+V). */
+    private fun clipboard(text: String, paste: Boolean) {
+        if (Clipboard.set(text)) {
+            if (paste) pressPaste()
+        } else if (paste && text.length <= MAX_TYPED_PASTE) {
+            typeWhatWeCan(text)
+        }
+    }
+
+    /** Type character by character, skipping the ones the virtual keyboard can't produce. */
+    private fun typeWhatWeCan(text: String) {
+        for (ch in text) {
+            injectAll(keyMap.getEvents(charArrayOf(ch)) ?: continue)
+        }
+    }
+
+    private fun injectAll(events: Array<KeyEvent>) {
+        for (e in events) {
+            injector.inject(KeyEvent.changeTimeRepeat(e, SystemClock.uptimeMillis(), 0))
+        }
+    }
+
+    private companion object {
+        /** Without a usable clipboard, a paste is typed key by key; only for short text. */
+        const val MAX_TYPED_PASTE = 2000
     }
 }
 
@@ -133,8 +185,9 @@ private class Injector {
         inject = i
     }
 
-    fun inject(event: InputEvent) {
-        // Mode 0 = INJECT_INPUT_EVENT_MODE_ASYNC: don't wait for the app to handle it.
-        inject.invoke(manager, event, 0)
+    fun inject(event: InputEvent, waitForFinish: Boolean = false) {
+        // INJECT_INPUT_EVENT_MODE_ASYNC (0): don't wait for the app to handle it.
+        // INJECT_INPUT_EVENT_MODE_WAIT_FOR_FINISH (2): return once the app has handled it.
+        inject.invoke(manager, event, if (waitForFinish) 2 else 0)
     }
 }

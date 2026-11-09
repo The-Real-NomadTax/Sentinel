@@ -15,7 +15,7 @@ use std::{
     },
     thread,
     path::PathBuf,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -125,8 +125,10 @@ impl Mirror {
                         Err(_) if shared.stop.load(Ordering::Relaxed) => MirrorStatus::Stopped,
                         Err(err) => MirrorStatus::Failed(format!("{err:#}")),
                     };
-                    shared.set_status(final_status);
+                    // Clean up first: it finishes any recording, so by the time the frontend
+                    // sees the session end, `stop_recording` can report the saved files.
                     cleanup(&shared);
+                    shared.set_status(final_status);
                 })
                 .expect("failed to spawn mirror thread")
         };
@@ -217,10 +219,13 @@ fn cleanup(shared: &Shared) {
 }
 
 fn run_session(serial: &str, config: &MirrorConfig, shared: &Shared) -> Result<()> {
-    agent::push(serial)?;
+    // A random socket name lets several sessions coexist on one device; the agent's jar is
+    // named after it so sessions never share (and delete) each other's copy.
+    let socket_name = format!("sentinel_{:016x}", agent::random_id());
+    let jar_path = agent::device_path(&socket_name);
+    let _jar = JarGuard { serial: serial.to_string(), path: jar_path.clone() };
+    agent::push_to(serial, &jar_path)?;
 
-    // A random socket name lets several sessions coexist on one device.
-    let socket_name = format!("sentinel_{:08x}", random_id());
     let port = adb::run(Some(serial), &["forward", "tcp:0", &format!("localabstract:{socket_name}")])?
         .trim()
         .parse::<u16>()
@@ -229,11 +234,12 @@ fn run_session(serial: &str, config: &MirrorConfig, shared: &Shared) -> Result<(
 
     let agent_cmd = format!(
         "CLASSPATH={path} app_process / {main} socket={socket_name} cleanup={path} \
-         max_size={} bit_rate={} max_fps={}",
+         max_size={} bit_rate={} max_fps={} control={}",
         config.max_size,
         config.bit_rate,
         config.max_fps,
-        path = agent::DEVICE_PATH,
+        u8::from(config.control),
+        path = jar_path,
         main = agent::MAIN_CLASS,
     );
     let mut child = adb::command(Some(serial))
@@ -446,7 +452,14 @@ impl Drop for ForwardGuard {
     }
 }
 
-fn random_id() -> u32 {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    (nanos as u32) ^ std::process::id().rotate_left(16)
+/// Deletes the session's agent jar if the agent never got to delete it itself.
+struct JarGuard {
+    serial: String,
+    path: String,
+}
+
+impl Drop for JarGuard {
+    fn drop(&mut self) {
+        agent::remove(&self.serial, &self.path);
+    }
 }

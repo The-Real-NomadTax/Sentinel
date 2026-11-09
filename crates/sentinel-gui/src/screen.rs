@@ -73,7 +73,7 @@ pub fn render(state: &ScreenState) -> AnyElement {
                 .track_focus(&state.focus)
                 .when_some(ctl.clone(), |el, ctl| {
                     el.on_key_down(move |event: &KeyDownEvent, _, cx| {
-                        if input::forward_key(&ctl, &event.keystroke) {
+                        if input::forward_key(&ctl, &event.keystroke, cx) {
                             cx.stop_propagation();
                         }
                     })
